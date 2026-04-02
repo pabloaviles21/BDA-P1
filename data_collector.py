@@ -18,13 +18,11 @@ def run_data_collector():
     # 3. Definir la ruta de la Landing Zone
     # Usamos la fecha de hoy para cumplir con la "ejecución periódica"
     today = datetime.now().strftime("%Y-%m-%d")
-    base_path = os.path.join('landing_zone', today)
-
     for slug, folder_name in datasets.items():
         print(f"--- Procesando: {folder_name} ---")
         
         # Crear la carpeta específica para este dataset
-        final_path = os.path.join(base_path, folder_name)
+        final_path = os.path.join('landing_zone', folder_name, today)
         os.makedirs(final_path, exist_ok=True)
 
         # Descarga y descompresión
