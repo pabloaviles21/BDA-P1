@@ -1,6 +1,7 @@
 import argparse
 import os
 from datetime import datetime
+import pandas as pd
 
 from kaggle.api.kaggle_api_extended import KaggleApi
 
@@ -33,8 +34,23 @@ def run_data_collector(execution_date=None):
 
         try:
             api.dataset_download_files(slug, path=final_path, unzip=True)
+            
+            # Convertir archivos CSV descargados a Parquet
+            for file in os.listdir(final_path):
+                if file.endswith('.csv'):
+                    csv_file_path = os.path.join(final_path, file)
+                    parquet_file_path = os.path.join(final_path, file.replace('.csv', '.parquet'))
+                    
+                    print(f"Convirtiendo a Parquet: {file}...")
+                    try:
+                        df = pd.read_csv(csv_file_path, low_memory=False)
+                        df.to_parquet(parquet_file_path, engine='pyarrow')
+                        os.remove(csv_file_path) # Borramos el CSV original
+                    except Exception as e:
+                        print(f"Error al convertir {file}: {e}")
+
             processed.append(folder_name)
-            print(f"Guardado en: {final_path}")
+            print(f"Guardado en formato Parquet en: {final_path}")
         except Exception as exc:
             failed.append(folder_name)
             print(f"ERROR descargando {folder_name}: {exc}")

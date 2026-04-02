@@ -115,16 +115,16 @@ def resolve_dataset_path(dataset_name, execution_date=None):
     return resolve_dataset_path(dataset_name, latest_date)
 
 
-def list_csv_files(dataset_path):
+def list_parquet_files(dataset_path):
     return sorted(
         os.path.join(dataset_path, file_name)
         for file_name in os.listdir(dataset_path)
-        if file_name.lower().endswith(".csv")
+        if file_name.lower().endswith(".parquet")
     )
 
 
-def infer_columns_from_csv(csv_files):
-    relation = duckdb.read_csv(csv_files[0], header=True, all_varchar=True)
+def infer_columns_from_parquet(parquet_files):
+    relation = duckdb.read_parquet(parquet_files[0])
     return relation.columns
 
 
@@ -138,7 +138,7 @@ def build_select_clause(dataset_name, original_columns):
         sanitized_names.append(sanitized_name)
 
         source_expr = f'"{original_name}"'
-        cleaned_expr = f"NULLIF(TRIM({source_expr}), '')"
+        cleaned_expr = f"NULLIF(TRIM({source_expr}::VARCHAR), '')"
 
         if sanitized_name in dataset_config.get("date_columns", {}):
             expr = (
@@ -162,8 +162,8 @@ def build_select_clause(dataset_name, original_columns):
     if dataset_name == "accidents_nyc" and "date" in sanitized_names and "time" in sanitized_names:
         select_parts.append(
             "CAST("
-            "TRY_STRPTIME(NULLIF(TRIM(\"DATE\"), ''), '%m/%d/%Y')::DATE + "
-            "TRY_STRPTIME(NULLIF(TRIM(\"TIME\"), ''), '%H:%M')::TIME "
+            "TRY_STRPTIME(NULLIF(TRIM(\"DATE\"::VARCHAR), ''), '%m/%d/%Y')::DATE + "
+            "TRY_STRPTIME(NULLIF(TRIM(\"TIME\"::VARCHAR), ''), '%H:%M')::TIME "
             "AS TIMESTAMP"
             ") AS collision_timestamp"
         )
@@ -171,23 +171,18 @@ def build_select_clause(dataset_name, original_columns):
     return ",\n    ".join(select_parts)
 
 
-def create_or_replace_table(connection, dataset_name, csv_files):
+def create_or_replace_table(connection, dataset_name, parquet_files):
     dataset_config = DATASETS[dataset_name]
-    original_columns = infer_columns_from_csv(csv_files)
+    original_columns = infer_columns_from_parquet(parquet_files)
     select_clause = build_select_clause(dataset_name, original_columns)
-    escaped_csv_files = [file_path.replace("\\", "\\\\") for file_path in csv_files]
-    csv_list_sql = ", ".join(f"'{file_path}'" for file_path in escaped_csv_files)
+    escaped_parquet_files = [file_path.replace("\\", "\\\\") for file_path in parquet_files]
+    parquet_list_sql = ", ".join(f"'{file_path}'" for file_path in escaped_parquet_files)
 
     query = f"""
         CREATE OR REPLACE TABLE {dataset_config['table_name']} AS
         SELECT
             {select_clause}
-        FROM read_csv(
-            [{csv_list_sql}],
-            header = true,
-            all_varchar = true,
-            ignore_errors = false
-        )
+        FROM read_parquet([{parquet_list_sql}])
     """
     connection.execute(query)
 
@@ -216,16 +211,16 @@ def run_data_formatting_pipeline(execution_date=None, db_path="formatted_zone.db
                 print(f"ERROR: No se encontro una carpeta para {dataset_name}.")
                 continue
 
-            csv_files = list_csv_files(dataset_path)
-            if not csv_files:
-                failed.append((dataset_name, f"No hay CSVs en {dataset_path}."))
-                print(f"ERROR: No hay CSVs en {dataset_path}.")
+            parquet_files = list_parquet_files(dataset_path)
+            if not parquet_files:
+                failed.append((dataset_name, f"No hay archivos Parquet en {dataset_path}."))
+                print(f"ERROR: No hay archivos Parquet en {dataset_path}.")
                 continue
 
             try:
-                create_or_replace_table(connection, dataset_name, csv_files)
+                create_or_replace_table(connection, dataset_name, parquet_files)
                 print_table_schema(connection, dataset_config["table_name"])
-                processed.append((dataset_name, resolved_date, len(csv_files)))
+                processed.append((dataset_name, resolved_date, len(parquet_files)))
                 print(
                     f"Tabla {dataset_config['table_name']} creada con exito para la fecha {resolved_date}.\n"
                 )
