@@ -13,8 +13,6 @@ def run_data_formatting_pipeline():
     # 2. Definir rutas
     # Suponiendo que procesamos los datos bajados hoy
     today = datetime.now().strftime("%Y-%m-%d")
-    landing_base_path = os.path.join('landing_zone', today)
-    
     # Base de datos relacional de la Formatted Zone
     db_path = "formatted_zone.db"
     db_url = f"jdbc:duckdb:{db_path}"
@@ -28,7 +26,7 @@ def run_data_formatting_pipeline():
 
     # 3. Procesar cada dataset
     for folder_name, table_name in datasets.items():
-        dataset_path = os.path.join(landing_base_path, folder_name)
+        dataset_path = os.path.join('landing_zone', folder_name, today)
         print(f"--- Procesando dataset: {folder_name} ---")
         
         # Leer todos los CSV de esa carpeta con Spark
