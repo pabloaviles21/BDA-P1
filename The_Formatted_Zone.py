@@ -1,10 +1,11 @@
-import argparse
 import os
 import re
 from datetime import datetime
+import urllib.request
 
 import duckdb
-
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import expr
 
 DATASETS = {
     "uber_trips": {
@@ -82,37 +83,16 @@ def list_available_dates(dataset_name):
                 except ValueError:
                     continue
 
-    legacy_root = os.path.join("landing_zone")
-    if os.path.isdir(legacy_root):
-        for entry in os.listdir(legacy_root):
-            entry_path = os.path.join(legacy_root, entry, dataset_name)
-            if os.path.isdir(entry_path):
-                try:
-                    datetime.strptime(entry, "%Y-%m-%d")
-                    available_dates.append(entry)
-                except ValueError:
-                    continue
-
     return sorted(set(available_dates))
 
 
-def resolve_dataset_path(dataset_name, execution_date=None):
-    if execution_date:
-        candidates = [
-            os.path.join("landing_zone", dataset_name, execution_date),
-            os.path.join("landing_zone", execution_date, dataset_name),
-        ]
-        for candidate in candidates:
-            if os.path.isdir(candidate):
-                return execution_date, candidate
-        return execution_date, None
-
+def resolve_dataset_path(dataset_name):
     available_dates = list_available_dates(dataset_name)
     if not available_dates:
         return None, None
 
     latest_date = available_dates[-1]
-    return resolve_dataset_path(dataset_name, latest_date)
+    return latest_date, os.path.join("landing_zone", dataset_name, latest_date)
 
 
 def list_parquet_files(dataset_path):
@@ -123,145 +103,119 @@ def list_parquet_files(dataset_path):
     )
 
 
-def infer_columns_from_parquet(parquet_files):
-    relation = duckdb.read_parquet(parquet_files[0])
-    return relation.columns
+def map_duckdb_format_to_spark(fmt):
+    """Convierte formatos como "%m/%d/%Y" al estilo Spark "M/d/yyyy"."""
+    return (
+        fmt.replace("%m", "M")
+        .replace("%d", "d")
+        .replace("%Y", "yyyy")
+        .replace("%H", "H")
+        .replace("%M", "mm")
+    )
 
 
-def build_select_clause(dataset_name, original_columns):
+def format_dataframe(df, dataset_name):
     dataset_config = DATASETS[dataset_name]
-    select_parts = []
-    sanitized_names = []
 
-    for original_name in original_columns:
-        sanitized_name = sanitize_column_name(original_name)
-        sanitized_names.append(sanitized_name)
+    # Homogeneizar los nombres de las columnas
+    for old_col in df.columns:
+        new_col = sanitize_column_name(old_col)
+        df = df.withColumnRenamed(old_col, new_col)
 
-        source_expr = f'"{original_name}"'
-        cleaned_expr = f"NULLIF(TRIM({source_expr}::VARCHAR), '')"
+    columns = df.columns
 
-        if sanitized_name in dataset_config.get("date_columns", {}):
-            expr = (
-                f"TRY_STRPTIME({cleaned_expr}, "
-                f"'{dataset_config['date_columns'][sanitized_name]}')::DATE AS {sanitized_name}"
-            )
-        elif sanitized_name in dataset_config.get("time_columns", {}):
-            expr = (
-                f"TRY_STRPTIME({cleaned_expr}, "
-                f"'{dataset_config['time_columns'][sanitized_name]}')::TIME AS {sanitized_name}"
-            )
-        elif sanitized_name in dataset_config.get("integer_columns", []):
-            expr = f"TRY_CAST({cleaned_expr} AS INTEGER) AS {sanitized_name}"
-        elif sanitized_name in dataset_config.get("double_columns", []):
-            expr = f"TRY_CAST({cleaned_expr} AS DOUBLE) AS {sanitized_name}"
-        else:
-            expr = f"{cleaned_expr} AS {sanitized_name}"
+    # Aplicar transformaciones y types especificadas
+    for col_name in columns:
+        if col_name in dataset_config.get("date_columns", {}):
+            fmt = map_duckdb_format_to_spark(dataset_config["date_columns"][col_name])
+            df = df.withColumn(col_name, expr(f"try_to_date(`{col_name}`, '{fmt}')"))
 
-        select_parts.append(expr)
+        elif col_name in dataset_config.get("time_columns", {}):
+            if dataset_name == "accidents_nyc" and col_name == "time":
+                df = df.withColumn(col_name, expr(f"NULLIF(TRIM(`{col_name}`), '')"))
+            else:
+                fmt = map_duckdb_format_to_spark(dataset_config["time_columns"][col_name])
+                df = df.withColumn(col_name, expr(f"try_to_timestamp(`{col_name}`, '{fmt}')"))
 
-    if dataset_name == "accidents_nyc" and "date" in sanitized_names and "time" in sanitized_names:
-        select_parts.append(
-            "CAST("
-            "TRY_STRPTIME(NULLIF(TRIM(\"DATE\"::VARCHAR), ''), '%m/%d/%Y')::DATE + "
-            "TRY_STRPTIME(NULLIF(TRIM(\"TIME\"::VARCHAR), ''), '%H:%M')::TIME "
-            "AS TIMESTAMP"
-            ") AS collision_timestamp"
+        elif col_name in dataset_config.get("integer_columns", []):
+            df = df.withColumn(col_name, expr(f"try_cast(`{col_name}` as int)"))
+
+        elif col_name in dataset_config.get("double_columns", []):
+            df = df.withColumn(col_name, expr(f"try_cast(`{col_name}` as double)"))
+
+    # Columna calculada personalizada (solo para accidents_nyc)
+    if dataset_name == "accidents_nyc" and "date" in columns and "time" in columns:
+        df = df.withColumn(
+            "collision_timestamp",
+            expr("try_to_timestamp(concat(date_format(date, 'yyyy-MM-dd'), ' ', `time`))"),
         )
 
-    return ",\n    ".join(select_parts)
+    return df
 
 
-def create_or_replace_table(connection, dataset_name, parquet_files):
-    dataset_config = DATASETS[dataset_name]
-    original_columns = infer_columns_from_parquet(parquet_files)
-    select_clause = build_select_clause(dataset_name, original_columns)
-    escaped_parquet_files = [file_path.replace("\\", "\\\\") for file_path in parquet_files]
-    parquet_list_sql = ", ".join(f"'{file_path}'" for file_path in escaped_parquet_files)
-
-    query = f"""
-        CREATE OR REPLACE TABLE {dataset_config['table_name']} AS
-        SELECT
-            {select_clause}
-        FROM read_parquet([{parquet_list_sql}])
-    """
-    connection.execute(query)
 
 
-def print_table_schema(connection, table_name):
-    rows = connection.execute(f"DESCRIBE {table_name}").fetchall()
-    print(f"Esquema de '{table_name}':")
-    for column_name, column_type, *_ in rows:
-        print(f" - {column_name}: {column_type}")
+def run_data_formatting_pipeline(db_path="formatted_zone.db"):
+    print("Iniciando pipeline de Formatted Zone con Apache Spark y escritura en DuckDB...")
 
+    # Descargar el driver JDBC si no existe (nombrado duckdb.jar como en el ejemplo)
+    jar_path = "duckdb.jar"
+    if not os.path.exists(jar_path):
+        print("Descargando DuckDB JDBC driver...")
+        urllib.request.urlretrieve("https://repo1.maven.org/maven2/org/duckdb/duckdb_jdbc/0.10.1/duckdb_jdbc-0.10.1.jar", jar_path)
 
-def run_data_formatting_pipeline(execution_date=None, db_path="formatted_zone.db"):
-    print("Iniciando pipeline de Formatted Zone con DuckDB...")
-    connection = duckdb.connect(db_path)
+    # 1. Inicializar la base de datos (mismo estilo que el notebook)
+    if os.path.isfile(db_path):
+        os.remove(db_path)
+    conn = duckdb.connect(db_path)
+    conn.close()
 
-    processed = []
-    failed = []
+    # 2. Inicializar sesión de Spark
+    # Usamos driver.extraClassPath en Windows para evitar el error de winutils.exe 
+    # que daba al utilizar 'spark.jars'
+    spark = (
+        SparkSession.builder
+        .appName("FormattedZonePipeline")
+        .config("spark.driver.extraClassPath", jar_path)
+        .config("spark.ui.enabled", "false")
+        .getOrCreate()
+    )
+    
+    spark.sparkContext.setLogLevel("ERROR")
+    spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "false")
 
     try:
         for dataset_name, dataset_config in DATASETS.items():
-            resolved_date, dataset_path = resolve_dataset_path(dataset_name, execution_date)
+            resolved_date, dataset_path = resolve_dataset_path(dataset_name)
             print(f"--- Procesando dataset: {dataset_name} ---")
 
             if not dataset_path:
-                failed.append((dataset_name, "No se encontro una carpeta valida en landing_zone."))
                 print(f"ERROR: No se encontro una carpeta para {dataset_name}.")
                 continue
 
             parquet_files = list_parquet_files(dataset_path)
-            if not parquet_files:
-                failed.append((dataset_name, f"No hay archivos Parquet en {dataset_path}."))
-                print(f"ERROR: No hay archivos Parquet en {dataset_path}.")
-                continue
+            # 1. Leer los datos Parquet
+            df = spark.read.parquet(*parquet_files)
 
-            try:
-                create_or_replace_table(connection, dataset_name, parquet_files)
-                print_table_schema(connection, dataset_config["table_name"])
-                processed.append((dataset_name, resolved_date, len(parquet_files)))
-                print(
-                    f"Tabla {dataset_config['table_name']} creada con exito para la fecha {resolved_date}.\n"
+            # 2. Formatear usando PySpark DataFrame API
+            df_formatted = format_dataframe(df, dataset_name)
+
+            # 3. Cargar en DuckDB desde pandas para evitar conflictos JDBC en Windows
+            table_name = dataset_config["table_name"]
+            pdf = df_formatted.toPandas()
+            with duckdb.connect(db_path) as conn:
+                conn.register("tmp_df", pdf)
+                conn.execute(
+                    f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM tmp_df"
                 )
-            except Exception as exc:
-                failed.append((dataset_name, str(exc)))
-                print(f"ERROR procesando {dataset_name}: {exc}\n")
+                conn.unregister("tmp_df")
+
+            print(
+                f"Tabla {table_name} creada con exito en DuckDB para la fecha {resolved_date}.\n"
+            )
     finally:
-        connection.close()
-
-    print("Resumen de la Formatted Zone:")
-    print(f"Datasets procesados correctamente: {len(processed)}")
-    print(f"Datasets con error: {len(failed)}")
-
-    if failed:
-        for dataset_name, message in failed:
-            print(f"- {dataset_name}: {message}")
-
-    return {"processed": processed, "failed": failed}
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Normaliza la landing zone y la carga en DuckDB."
-    )
-    parser.add_argument(
-        "--date",
-        dest="execution_date",
-        help="Fecha a procesar en formato YYYY-MM-DD. Si no se indica, usa la ultima disponible por dataset.",
-    )
-    parser.add_argument(
-        "--db-path",
-        dest="db_path",
-        default="formatted_zone.db",
-        help="Ruta del fichero DuckDB de salida. Por defecto usa formatted_zone.db.",
-    )
-    return parser.parse_args()
+        spark.stop()
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    run_data_formatting_pipeline(
-        execution_date=args.execution_date,
-        db_path=args.db_path,
-    )
+    run_data_formatting_pipeline()
