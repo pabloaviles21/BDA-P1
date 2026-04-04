@@ -128,7 +128,7 @@ def format_dataframe(df, dataset_name):
     for col_name in columns:
         if col_name in dataset_config.get("date_columns", {}):
             fmt = map_duckdb_format_to_spark(dataset_config["date_columns"][col_name])
-            df = df.withColumn(col_name, expr(f"try_to_date(`{col_name}`, '{fmt}')"))
+            df = df.withColumn(col_name, expr(f"to_date(`{col_name}`, '{fmt}')"))
 
         elif col_name in dataset_config.get("time_columns", {}):
             if dataset_name == "accidents_nyc" and col_name == "time":
