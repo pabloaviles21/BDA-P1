@@ -553,9 +553,10 @@ if __name__ == "__main__":
     """
     Main execution point of the Trusted Zone Pipeline.
     """
+    import os
     try:
         execute_trusted_zone_pipeline()
-        sys.exit(0)
+        os._exit(0)  # <-- El cierre forzoso mágico en caso de éxito
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}")
-        sys.exit(1)
+        os._exit(1)  # <-- El cierre forzoso en caso de error
