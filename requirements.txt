@@ -1,3 +1,5 @@
 kaggle
 pyspark
 duckdb
+pandas
+pyarrow
