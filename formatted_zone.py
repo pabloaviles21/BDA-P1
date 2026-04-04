@@ -219,3 +219,7 @@ def run_data_formatting_pipeline(db_path="formatted_zone.db"):
 
 if __name__ == "__main__":
     run_data_formatting_pipeline()
+    
+    # Forzar el cierre inmediato para evitar que Spark/Java se queden colgados en Windows
+    import os
+    os._exit(0)
